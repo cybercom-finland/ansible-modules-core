@@ -70,7 +70,12 @@ options:
    subnet_name:
      description:
         - Name of the subnet to whose interface should be attached to the router.
-     required: true
+     required: false
+     default: None
+   port_name:
+     description:
+        - Name of the port that will be the interface that is attached to the router.
+     required: false
      default: None
    tenant_name:
      description:
@@ -88,6 +93,14 @@ EXAMPLES = '''
                             tenant_name=tenant1
                             router_name=external_route
                             subnet_name=t1subnet
+
+# Attach port testport to the external router
+- quantum_router_interface: state=present login_username=admin
+                            login_password=admin
+                            login_tenant_name=admin
+                            tenant_name=tenant1
+                            router_name=external_route
+                            port_name=testport
 '''
 
 
@@ -157,7 +170,6 @@ def _get_router_id(module, neutron):
 
 
 def _get_subnet_id(module, neutron):
-    subnet_id = None
     kwargs = {
             'tenant_id': _os_tenant_id,
             'name': module.params['subnet_name'],
@@ -170,7 +182,20 @@ def _get_subnet_id(module, neutron):
         return None
     return subnets['subnets'][0]['id']
 
-def _get_port_id(neutron, module, router_id, subnet_id):
+def _get_port_id(module, neutron):
+    kwargs = {
+            'tenant_id': _os_tenant_id,
+            'name': module.params['port_name'],
+    }
+    try:
+        ports = neutron.list_ports(**kwargs)
+    except Exception, e:
+        module.fail_json( msg = " Error in getting the ports list:%s " % e.message)
+    if not ports['ports']:
+        return None
+    return ports['ports'][0]['id']
+
+def _get_router_port_id(neutron, module, router_id, subnet_id, port_id):
     kwargs = {
             'tenant_id': _os_tenant_id,
             'device_id': router_id,
@@ -182,24 +207,28 @@ def _get_port_id(neutron, module, router_id, subnet_id):
     if not ports['ports']:
         return None
     for port in  ports['ports']:
+        if port['id'] == port_id:
+            return port['id']
         for subnet in port['fixed_ips']:
             if subnet['subnet_id'] == subnet_id:
                 return port['id']
     return None
 
-def _add_interface_router(neutron, module, router_id, subnet_id):
+def _add_interface_router(neutron, module, router_id, subnet_id, port_id):
     kwargs = {
-        'subnet_id': subnet_id
+        'subnet_id': subnet_id,
+        'port_id': port_id
     }
+    _clean_none(kwargs)
     try:
-        neutron.add_interface_router(router_id, kwargs)
+        port = neutron.add_interface_router(router_id, kwargs)
     except Exception, e:
         module.fail_json(msg = "Error in adding interface to router: %s" % e.message)
-    return True
+    return port['id']
 
-def  _remove_interface_router(neutron, module, router_id, subnet_id):
+def  _remove_interface_router(neutron, module, router_id, port_id):
     kwargs = {
-        'subnet_id': subnet_id
+        'port_id': port_id
     }
     try:
         neutron.remove_interface_router(router_id, kwargs)
@@ -207,15 +236,22 @@ def  _remove_interface_router(neutron, module, router_id, subnet_id):
         module.fail_json(msg="Error in removing interface from router: %s" % e.message)
     return True
 
+def _clean_none(dictionary):
+    for key in dictionary.keys():
+        if dictionary[key] is None:
+            dictionary.pop(key)
+
 def main():
     argument_spec = openstack_argument_spec()
     argument_spec.update(dict(
             router_name                     = dict(required=True),
-            subnet_name                     = dict(required=True),
+            subnet_name                     = dict(required=False),
+            port_name                       = dict(required=False),
             tenant_name                     = dict(default=None),
             state                           = dict(default='present', choices=['absent', 'present']),
     ))
-    module = AnsibleModule(argument_spec=argument_spec)
+    module = AnsibleModule(argument_spec=argument_spec,
+		    mutually_exclusive=[['subnet_name', 'port_name']])
 
     neutron = _get_neutron_client(module, module.params)
     _set_tenant_id(module)
@@ -224,22 +260,31 @@ def main():
     if not router_id:
         module.fail_json(msg="failed to get the router id, please check the router name")
 
-    subnet_id = _get_subnet_id(module, neutron)
-    if not subnet_id:
-        module.fail_json(msg="failed to get the subnet id, please check the subnet name")
+    subnet_id = None
+    port_id = None
+    if module.params['subnet_name']:
+        subnet_id = _get_subnet_id(module, neutron)
+        if not subnet_id:
+            module.fail_json(msg="failed to get the subnet id, please check the subnet name")
+    elif module.params['port_name']:
+        port_id = _get_port_id(module, neutron)
+        if not port_id:
+            module.fail_json(msg="failed to get the port id, please check the port name")
+    else:
+        module.fail_json(msg="Provide either port_name or router_name")
 
     if module.params['state'] == 'present':
-        port_id = _get_port_id(neutron, module, router_id, subnet_id)
-        if not port_id:
-            _add_interface_router(neutron, module, router_id, subnet_id)
-            module.exit_json(changed=True, result="created", id=port_id)
-        module.exit_json(changed=False, result="success", id=port_id)
+        old_port_id = _get_router_port_id(neutron, module, router_id, subnet_id, port_id)
+        if not old_port_id or (port_id and old_port_id and port_id != old_port_id):
+            new_port_id = _add_interface_router(neutron, module, router_id, subnet_id, port_id)
+            module.exit_json(changed=True, result="created", id=new_port_id)
+        module.exit_json(changed=False, result="success", id=old_port_id)
 
     if module.params['state'] == 'absent':
-        port_id = _get_port_id(neutron, module, router_id, subnet_id)
-        if not port_id:
+        old_port_id = _get_router_port_id(neutron, module, router_id, subnet_id, port_id)
+        if not old_port_id:
             module.exit_json(changed = False, result = "Success")
-        _remove_interface_router(neutron, module, router_id, subnet_id)
+        _remove_interface_router(neutron, module, router_id, old_port_id)
         module.exit_json(changed=True, result="Deleted")
 
 # this is magic, see lib/ansible/module.params['common.py
