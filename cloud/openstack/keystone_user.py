@@ -202,10 +202,15 @@ def ensure_tenant_absent(keystone, tenant, check_mode):
     """
     if not tenant_exists(keystone, tenant):
         return False
+    tenant_id = get_tenant_id(keystone, tenant)
 
     # We now know we will have to delete the tenant
     if check_mode:
         return True
+
+    keystone.tenants.delete(tenant_id)
+
+    return True
 
 
 def ensure_user_exists(keystone, user_name, password, email, tenant_name,
